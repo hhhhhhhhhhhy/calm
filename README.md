@@ -17,7 +17,7 @@ This is achieved through a two-stage process:
 1.  **A high-fidelity autoencoder** learns to compress K tokens into a single vector and reconstruct them with near-perfect accuracy.
 2.  **A continuous-domain language model** then performs autoregressive prediction in this vector space.
 
-An in-depth explaination of CALM is available in [this blog](https://shaochenze.github.io/blog/2025/CALM).
+An in-depth explanation of CALM is available in [this blog](https://shaochenze.github.io/blog/2025/CALM).
 
 ### Key Features
 
@@ -281,6 +281,10 @@ torchrun --nnodes 1 --node_rank 0 --nproc_per_node 8 \
     --bf16 True
 ```
 </details>
+
+## Connection to Prior Work
+
+This work builds on insights from our prior research on [patch-level training](https://github.com/shaochenze/PatchTrain), which reduces training costs by 50% by grouping multiple tokens into a single 'patch' and training the model on a next-patch prediction objective. However, this approach was ultimately limited by the discrete nature of text, leaving inference still token-by-token. CALM overcomes this by shifting to a continuous domain, where semantic bandwidth becomes directly scalable.
 
 ## Contact
 
