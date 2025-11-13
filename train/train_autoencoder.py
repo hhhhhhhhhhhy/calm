@@ -572,14 +572,21 @@ def main():
                 batched=True,
             )
 
+    '''训练分支，准备训练集'''
     if training_args.do_train:
         if "train" not in tokenized_datasets:
             raise ValueError("--do_train requires a train dataset")
+        
+        # 取出训练集（此时每条样本已被 group_texts 函数切成固定 block_size 的 token 序列）
         train_dataset = lm_datasets["train"]
         if data_args.max_train_samples is not None:
+            # 若用户通过 --max_train_samples 限制训练样本数，则截取前 max_train_samples 条
             max_train_samples = min(len(train_dataset), data_args.max_train_samples)
             train_dataset = train_dataset.select(range(max_train_samples))
+            # 【注意】这里的“样本”对应论文中一条长度为 T 的离散 token 序列 x_{1:T}，
+            # 后续会被进一步按 patch_size=K 分组，得到 T/K 个 patch，供自编码器压缩。
 
+    '''准备验证集'''
     if training_args.do_eval:
         if "validation" not in tokenized_datasets:
             raise ValueError("--do_eval requires a validation dataset")
@@ -588,7 +595,7 @@ def main():
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
             eval_dataset = eval_dataset.select(range(max_eval_samples))
 
-    # Initialize our Trainer
+    # 初始化 HuggingFace Trainer 对象，负责后续训练/评估/日志/保存全流程
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -599,14 +606,17 @@ def main():
         preprocess_logits_for_metrics=None
     )
 
-    # Training
+    '''===== 训练阶段 ====='''
     if training_args.do_train:
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:
             checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
+
+        '''这一步就是训练，返回的 train_result 里含 loss、learning_rate、epoch 等信息'''
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        # 把当前最优模型（自编码器权重 θ）保存到 output_dir，同时保存 tokenizer，方便后续直接 `from_pretrained` 加载
         trainer.save_model()  # Saves the tokenizer too for easy upload
 
         metrics = train_result.metrics
@@ -615,7 +625,7 @@ def main():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
-    # Evaluation
+    '''===== 验证阶段 ====='''
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
 
