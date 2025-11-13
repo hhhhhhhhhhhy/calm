@@ -1,23 +1,25 @@
-#!/usr/bin/env python
-# coding=utf-8
-# Copyright 2020 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""
-Fine-tuning the library models for causal language modeling (GPT, GPT-2, CTRL, ...) on a text file or a dataset.
+'''
+目标：
+    将 K 个 token 压缩为一个连续向量，并能还原为原始 
+    
+    【token直接以token_id的形式存在，也就是一个个int整数，即在词表中的下标。一个batch的token就是 (batch_size, seq_len) 】
 
-Here is the full list of checkpoints on the hub that can be fine-tuned by this script:
-https://huggingface.co/models?filter=text-generation
-"""
-# You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
+关键配置：
+    config.patch_size = K: 每组 token 的数量
+    config.latent_dim: 向量的维度（如 128）
+    使用 Autoencoder 模型，结构为 Encoder + Decoder
+训练流程：
+    输入: token 序列（如 [B, T]）
+    分组：每 K 个 token 为一组（如 [B, T//K, K]）
+    编码：每组映射为一个向量 [B, T//K, latent_dim]
+    解码：每个向量还原为 K 个 token
+    损失：交叉熵（token 还原准确率 > 99.9%）
+正则化技巧（论文中提到）：
+    KL 正则化（防止向量空间塌陷）
+    Dropout（增强鲁棒性）
+    KL clipping（防止 posterior collapse）
+'''
+
 import logging
 import math
 import os
@@ -56,6 +58,7 @@ logger = logging.getLogger(__name__)
 
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 
+# 这几个常量仅在「从头训练 tokenizer」时才会用到
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
 DEFAULT_EOS_TOKEN = "</s>"
@@ -295,6 +298,7 @@ def main():
     #
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
+    '''1. 加载数据集'''
     if data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         raw_datasets = load_dataset(
@@ -369,7 +373,7 @@ def main():
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-
+    '''2. 加载 tokenizer 与配置'''
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
         "revision": model_args.model_revision,
@@ -407,7 +411,9 @@ def main():
 
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens(dict(pad_token=DEFAULT_PAD_TOKEN))
-    config.vocab_size = len(tokenizer)
+    config.vocab_size = len(tokenizer)      # 这个就是|V|
+
+    '''3. 实例化自编码器模型'''
     model_class = Autoencoder
     config.pad_token_id = tokenizer.pad_token_id
     config.eos_token_id = tokenizer.eos_token_id
@@ -431,9 +437,10 @@ def main():
         )
     else:
         model = model_class._from_config(config)
+    
+    '''4. 数据预处理函数'''
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
-
     column_names = "text"
     text_column_name = "text" if "text" in column_names else column_names[0]
 
@@ -467,6 +474,8 @@ def main():
                 batched=True,
                 remove_columns=column_names,
             )
+    
+    '''block_size必须能被K整除, 否则后续 group_texts会补齐'''
     if data_args.block_size is None:
         block_size = tokenizer.model_max_length
         if block_size > 1024:
@@ -484,35 +493,52 @@ def main():
             )
         block_size = min(data_args.block_size, tokenizer.model_max_length)
 
+    '''5. 将原始已分词文本处理成“K-对齐、定长”的训练块，供自编码器训练。'''
     # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
     def group_texts(examples):
+        """
+        输入：
+        examples: dict
+            'input_ids'      -> List[List[int]]  每条句子的 token ID 序列
+            'attention_mask' -> List[List[int]]  对应的有效位（0=pad，1=real）
+        输出：
+            dict 同 key，但每条序列长度 = block_size，且总长度是 K 的整数倍。
+        """
         # Concatenate all texts.
-        eos_token_id = tokenizer.eos_token_id
-        pad_token_id = tokenizer.pad_token_id
-        processed_input_ids = []
+        # ---------- 1. 获取特殊 token ID ----------
+        eos_token_id = tokenizer.eos_token_id   # </s> 或 <eos>，对应论文中“句尾”
+        pad_token_id = tokenizer.pad_token_id   # <pad>，用于补齐到 K 的倍数
+        processed_input_ids = []    # 保存处理后的 token 序列
         processed_attention_masks = []
 
+        # ---------- 2. 逐句处理 ----------
         for i in range(len(examples['input_ids'])):
-            input_ids_seq = examples['input_ids'][i]
+            input_ids_seq = examples['input_ids'][i]        # 当前句 token 序列
             attention_mask_seq = examples['attention_mask'][i]
 
+            # 句尾追加 <eos>
             input_ids_seq.append(eos_token_id)
             attention_mask_seq.append(1)
+            # 计算当前长度 |s|，并补齐到 K 的整数倍
             current_length = len(input_ids_seq)
             remainder = current_length % config.patch_size
             if remainder != 0:
                 padding_needed = config.patch_size - remainder
+                # 用 <pad> 补齐，保证整句可被均匀切分成若干个 x_{1:K}
                 input_ids_seq.extend([pad_token_id] * padding_needed)
                 attention_mask_seq.extend([1] * padding_needed)
             
             processed_input_ids.append(input_ids_seq)
             processed_attention_masks.append(attention_mask_seq)
 
+        # ---------- 3. 全局拼接 ----------
+        # 把所有句子首尾相接，形成一条长序列 S
         concatenated_examples = {
             'input_ids': list(chain(*processed_input_ids)),
             'attention_mask': list(chain(*processed_attention_masks))
         }
-
+        # ---------- 4. 按 block_size 切块 ----------
+        
         total_length = len(concatenated_examples[list(examples.keys())[0]])
         total_length = (total_length // block_size) * block_size
         # Split by chunks of max_len.
@@ -520,6 +546,7 @@ def main():
             k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
             for k, t in concatenated_examples.items()
         }
+        # 自编码器采用重构目标，labels 就是 input_ids 本身
         result["labels"] = result["input_ids"].copy()
         return result
 
