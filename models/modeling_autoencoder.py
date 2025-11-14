@@ -238,6 +238,7 @@ class Autoencoder(LlamaPreTrainedModel):
         logits = logits.view(-1, self.config.vocab_size)
         labels = labels.view(-1).to(logits.device)
         loss = loss_fct(logits, labels) 
+        
         # 总的loss：CE + KL散度，KL是为了约束z的分布使其对齐标准正态分布，分布更平滑，防止微小扰动
         if self.training:
             loss = loss * self.patch_size + kl_loss * self.kl_weight

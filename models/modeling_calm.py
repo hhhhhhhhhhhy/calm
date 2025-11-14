@@ -1,22 +1,19 @@
-# coding=utf-8
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+'''
+训练CALM主模型（支持三种模型:Energy Transformer单步生成、Diffusion和Flow是多步迭代）
+输入：
+token序列
+分patch → 编码为向量 → 预测下一个向量
+损失：energy score
+评估：brierLM
+
+K  : patch_size                 一个向量对应的 token 数
+L  : seq_length // K            patch序列长度（一个序列内patch的个数）
+l  : latent_dim                 向量维度（默认 128）
+
+z_i ∈ R^l : 第 i 个连续向量
+h_i ∈ R^d : Transformer 第 i 步隐藏状态
+x_{1:K} : 一个 patch 的原始 token ID
+'''
 import math
 from typing import List, Optional, Tuple, Union
 from dataclasses import dataclass, field
@@ -46,6 +43,9 @@ if is_flash_attn_2_available():
 
 logger = logging.get_logger(__name__)
 
+# ------------------------------------------------------------------
+# 输出容器：额外携带 Brier-n 分数
+# ------------------------------------------------------------------
 @dataclass
 class CustomCausalLMOutput(CausalLMOutputWithPast):
     brier1: torch.FloatTensor = None
@@ -61,12 +61,19 @@ class CALM(LlamaPreTrainedModel):
     """
     config_class = CALMConfig 
 
+     # --- 标准 embedding 接口 ---
     def get_input_embeddings(self):
         return self.transformer.embed_tokens
 
     def set_input_embeddings(self, value):
         self.transformer.embed_tokens = value
 
+    '''
+    ------------------------------------------------------------------
+    评估入口：计算 BrierLM
+    公式：Brier(P,y)=E[1{x1=y}+1{x2=y}−1{x1=x2}]
+    ------------------------------------------------------------------
+    '''
     @torch.no_grad()
     def eval_brier(self, latent_predictions, targets, outputs, loss):
         """
@@ -75,39 +82,45 @@ class CALM(LlamaPreTrainedModel):
         where x1 and x2 are two independent samples from the model, and y is the target.
 
         Args:
-            latent_predictions (torch.Tensor): Two sets of latent predictions from the model.
-                                               Shape: [n>2, batch_size, latent_length, latent_dim].
-            targets (torch.Tensor): The ground truth token ids. Shape: [batch_size, seq_length].
+            latent_predictions (torch.Tensor): Two sets of latent predictions from the model. 
+                                               Shape: [S, B, L, l], S>=2个采样
+            targets (torch.Tensor): The ground truth token ids. Shape: [B,T].
             outputs: The output object from the transformer, containing past_key_values.
             loss: The energy loss for latent vectors.
         """
-        max_eval_length = 4
+        max_eval_length = 4     # 计算 1~4 gram
         patch_size = self.patch_size
         batch_size = targets.shape[0]
-        seq_length = targets.shape[1] // patch_size
-        targets = targets.reshape(batch_size, seq_length, patch_size)
+        seq_length = targets.shape[1] // patch_size # L = T/K  
+        targets = targets.reshape(batch_size, seq_length, patch_size)       # [B,T] -> [B,L,K]
 
         # Use the first two samples for evaluation
+        # 仅取前两个潜变量样本 x1,x2 做蒙特卡洛估计
         latent_predictions = latent_predictions[:2].reshape(2, batch_size, seq_length, latent_predictions.size(-1))
+        # 通过 AE 解码器得到 logits 再 argmax → token patch
         logits_1 = self.ae_model.decoder(latent_states=latent_predictions[0])
         logits_2 = self.ae_model.decoder(latent_states=latent_predictions[1])
         predictions_1 = torch.argmax(logits_1, dim=-1).reshape(batch_size, seq_length, patch_size)
         predictions_2 = torch.argmax(logits_2, dim=-1).reshape(batch_size, seq_length, patch_size)
 
+        # ---- CASE-1：K ≥ 4，一步 patch 就足够 ----
         # CASE 1: The model's patch size is 4 or more.
         # In this case, each generation step produces enough tokens to calculate brier-4 directly.
         if patch_size >= max_eval_length:
-            acc_1 = torch.cumprod((predictions_1 == targets).float(), dim = -1)
+            # 逐位累积相等 → 得到 1..4-gram 是否完全匹配
+            acc_1 = torch.cumprod((predictions_1 == targets).float(), dim = -1) # [B, L, 4]
             acc_2 = torch.cumprod((predictions_2 == targets).float(), dim = -1)
-            var = torch.cumprod((predictions_1 == predictions_2).float(), dim = -1)
-            brier_estimations = (acc_1 + acc_2 - var).mean(dim=(0,1))
-            
+            var = torch.cumprod((predictions_1 == predictions_2).float(), dim = -1) # 1{x1=x2}
+            brier_estimations = (acc_1 + acc_2 - var).mean(dim=(0,1))   # 按 batch&length 平均
+        
+        # ---- CASE-2：K < 4，需要自回归拼接多个 patch ----
         # CASE 2: The model's patch size is less than 4.
         # We need to auto-regressively generate multiple patches to get a 4-token sequence.
         else:
             # how many steps are needed to produce 4 tokens.
-            num_steps_to_cover = math.ceil(max_eval_length / patch_size)
+            num_steps_to_cover = math.ceil(max_eval_length / patch_size)    # 需要几个 patch
 
+            # 先把 targets 与预测 patch 滑窗拼接成 4-token 超patch
             # --- Calculate the accuracy part of the Brier score (1{x=y}) ---
             predictions_1_cat = torch.cat([predictions_1[:, i:-(num_steps_to_cover-i), :] for i in range(num_steps_to_cover)], dim = -1)
             predictions_2_cat = torch.cat([predictions_2[:, i:-(num_steps_to_cover-i), :] for i in range(num_steps_to_cover)], dim = -1)
@@ -117,7 +130,8 @@ class CALM(LlamaPreTrainedModel):
 
             global_cache = outputs.past_key_values
             brier_estimations = []
-
+            
+            # 对每一个起始位置 i 自回归生成后续 patch，计算 1{x1=x2}
             # --- Autoregressive Estimation of Uncertainty Term (1{x1=x2}) ---
             # Loop over every possible starting position in the sequence.
             for i in range(seq_length - num_steps_to_cover):
@@ -125,9 +139,11 @@ class CALM(LlamaPreTrainedModel):
                 token_same = torch.empty(batch_size, max_eval_length, dtype=torch.bool, device=latent_predictions.device)
                 for j in range(num_steps_to_cover):
                     if j == 0:
+                        # 第一个 patch 直接取用已解码结果
                         next_tokens = torch.stack((predictions_1[:, i, :], predictions_2[:, i, :]), dim = 0)
                         current_cache = tuple(tuple(x[:, :, :i+1, :] for x in layer_cache) for layer_cache in global_cache)
                     else:
+                        # 后续 patch 需重新 forward Transformer
                         inputs_embeds = self.transformer.embed_tokens(current_input).reshape(batch_size, -1)
                         inputs_embeds = self.embed_proj(inputs_embeds)
                         outputs = self.transformer(
@@ -142,6 +158,7 @@ class CALM(LlamaPreTrainedModel):
                         next_tokens = torch.argmax(logits, dim=-1).reshape(2, batch_size, patch_size)
                         current_cache = outputs.past_key_values
 
+                    # 仅用 x1 更新 KV-cache（优化）
                     # Optimization: The KV cache is only updated along the path of the first sample (x1).
                     current_input = next_tokens[0]
 
@@ -182,13 +199,14 @@ class CALM(LlamaPreTrainedModel):
             brier4=brier_estimations[3],
         )
         
-
+    # =========  4. 温度采样（无 softmax） =========
+    '''温度采样，无需softmax'''
     @torch.no_grad()
     def temperature_sampling(
         self,
-        hidden_states: torch.Tensor,
-        temperature: float = 0.5,
-        num_samples: int = 200,
+        hidden_states: torch.Tensor,    # 来自 Transformer 的最后隐藏状态, h_{i-1}
+        temperature: float = 0.5,       # T，必须满足 1/T ∈ ℕ
+        num_samples: int = 200,         # N，论文中的 batch size N
     ):
         """
         Generates a patch of tokens using the approximate temperature sampling algorithm.
@@ -202,6 +220,14 @@ class CALM(LlamaPreTrainedModel):
         Returns:
             torch.LongTensor: The generated patch of token IDs.
                               Shape: (..., patch_size).
+
+        近似温度采样，对应论文【Paper:Algorithm-2】。
+        步骤：
+        1. 生成 N 个候选潜向量 z；
+        2. 解码为 token-patch；
+        3. 统计出现次数；
+        4. 按 n=1/T 做级联选择（n, n-1, ...）；
+        5. 按 C(k,n) 加权采样输出。
         """
 
         # Validate temperature and calculate n.
@@ -275,6 +301,7 @@ class CALM(LlamaPreTrainedModel):
         return final_output
 
 
+    '''自回归生成，每次生成一个patch，使用temparature_sampling控制多样性'''
     @torch.no_grad()
     def generate(
         self,
@@ -291,12 +318,17 @@ class CALM(LlamaPreTrainedModel):
 
         It replaces the standard Hugging Face `GenerationMixin.generate()` method, which
         is not compatible with this model's architecture.
+
+        自回归生成，每次生成一个 patch（K 个 token），
+        内部调用 temperature_sampling 控制多样性。
+        与 HF 标准 generate 不兼容，故重写。
         """
         self.eval()
         patch_size = self.patch_size
         batch_size = input_ids.shape[0]
         use_cache = True
         
+        # 保证提示长度是 K 的整数倍，不足补 pad
         # Ensure the input prompt length is a multiple of patch_size. If not, pad it.
         prompt_len = input_ids.shape[1]
         if prompt_len % patch_size != 0:
@@ -306,7 +338,8 @@ class CALM(LlamaPreTrainedModel):
 
         past_key_values = None
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
-        
+
+        # ---- 主循环：一次生成 K 个 token ----
         # --- Generation Loop ---
         while True:
             # Prepare model inputs
@@ -318,8 +351,9 @@ class CALM(LlamaPreTrainedModel):
             num_patches = current_seq_len // patch_size
             
             # Convert discrete tokens to patch embeddings
+            # 将离散 token 转为 patch 嵌入
             inputs_embeds = self.transformer.embed_tokens(current_input_ids).reshape(batch_size, num_patches, -1)
-            inputs_embeds = self.embed_proj(inputs_embeds)
+            inputs_embeds = self.embed_proj(inputs_embeds)      # 线性投影到 d 维
 
             # Get the hidden_state for the next position from the Transformer
             outputs = self.transformer(
@@ -327,13 +361,15 @@ class CALM(LlamaPreTrainedModel):
                 past_key_values=past_key_values,
                 use_cache=True,
             )
-            hidden_states = outputs[0]
+            hidden_states = outputs[0]      # [B, num_patches, d]
             past_key_values = outputs.past_key_values if use_cache else None
 
+            # 取最后一个 patch 的隐藏状态作为条件
             # Use the MLPGenerator and autoencoder to generate the next K tokens
-            last_hidden_state = hidden_states[:, -1, :] # Shape: [batch_size, hidden_size]
-            next_tokens = self.temperature_sampling(last_hidden_state, temperature=temperature)
+            last_hidden_state = hidden_states[:, -1, :] # Shape: [batch_size, hidden_size]      # [B, d]
+            next_tokens = self.temperature_sampling(last_hidden_state, temperature=temperature) # [B, K]
 
+            # 若序列已结束，用 pad 填充
             # If a sequence is finished, fill with pad_token
             next_tokens = next_tokens * unfinished_sequences[:, None] + self.padding_idx * (1 - unfinished_sequences[:, None])
 
@@ -349,7 +385,7 @@ class CALM(LlamaPreTrainedModel):
 
         # The `input_ids` tensor now looks like: [prompt, initial_padding, generated_content, final_padding]
         # We need to re-arrange it to: [prompt, generated_content, all_padding]
-
+        # 后处理：把 pad 移到末尾，保持输出整洁
         clean_outputs = []
         seq_length = input_ids.shape[1]
         for i in range(batch_size):
