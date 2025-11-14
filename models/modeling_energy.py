@@ -228,7 +228,7 @@ class EnergyTransformer(CALM):
         # 第一项：E[||z̃_i - z̃_j||^β]
         distance_x = distance_matrix.sum(dim=(0, 1)) / (n_x * (n_x - 1))
 
-        # 从 posterior 采样 M=100 个目标向量 y~q(z|x)
+        # 从 posterior （也就是autoencoder根据y生成的μ σ分布）中采样 M=100 个目标向量 y~q(z|x)
         std = torch.exp(log_std)
         n_y = 100
         eps = torch.randn((n_y, *mean.shape), device=mean.device)
@@ -254,41 +254,44 @@ class EnergyTransformer(CALM):
         **kwargs
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         """
-        input_ids: (batch, seq)  已补全成 K 的倍数
+        input_ids: (batch, seq)  已补全成 K 的倍数, 如seq = B * L
         labels:   (batch, seq)  用于重建目标，与 input_ids 对齐
         返回      CustomCausalLMOutput，包含 loss 与（评估时）brier 指标
+
+        labels要去掉第一个patch，inputs要去掉最后一个patch
+        这样，inputs的第i个正好对应labels的第i+1个patch，也就是它需要学的next token
+
         """
 
         batch_size, seq_length = input_ids.size()
-        patch_size = self.patch_size
-        latent_length = seq_length // patch_size
+        patch_size = self.patch_size    # K
+        latent_length = seq_length // patch_size    # patch序列的len
 
         # 只对「下一个 patch」做预测，因此 labels 去掉第一个 patch
-        labels = labels[:, patch_size:]
+        labels = labels[:, patch_size:]     # [B, (L-1)*K]
         mask = labels.ne(-100)          # 计算 loss 时忽略 pad
         labels = labels[mask].unsqueeze(0)
 
         # 1. 用冻结的自编码器得到目标 posterior  q(z|x_{1:K})
-        #    latent_states = [μ, logσ]  对应论文公式
-        latent_states = self.ae_model.encoder(input_ids=labels)
-        latent_states = latent_states.squeeze(0)
-        mean, log_std = torch.chunk(latent_states, 2, dim=-1)
+        latent_states = self.ae_model.encoder(input_ids=labels)     # μ, logσ ( [B, L-1, 2*l]  )
+        latent_states = latent_states.squeeze(0)   # 推理时B=1, 这一步可以把B这个维度去掉
+        mean, log_std = torch.chunk(latent_states, 2, dim=-1)   # [B, L-1, l], [B, L-1, l]
 
         # 2. Transformer 输入：把前一个 patch 的 K 个 token 嵌入压缩成单向量
-        inputs_embeds = self.transformer.embed_tokens(input_ids)\
-                                        .reshape(batch_size, latent_length, -1)[:, :-1, :]
-        inputs_embeds = self.embed_proj(inputs_embeds)
+        inputs_embeds = self.transformer.embed_tokens(input_ids)\             
+                                        .reshape(batch_size, latent_length, -1)[:, :-1, :]  # [B, L-1, K × hidden_size]
+        inputs_embeds = self.embed_proj(inputs_embeds)   # [B, L-1, hidden_size]
 
         # 3. 得到 Transformer 隐状态 y_i-1
         outputs = self.transformer(inputs_embeds=inputs_embeds)
-        hidden_states = outputs[0]                      # (batch, L-1, hidden)
+        hidden_states = outputs[0]                      # (B, L-1, d), d是Llama2-7B的隐藏层维度
         # 只保留有效 patch 位置
         patch_mask = mask.reshape(batch_size, latent_length - 1, patch_size)[:, :, 0]
         hidden_states = hidden_states[patch_mask]       # (total_patches, hidden)
 
         # 4. 生成 N 个样本 z̃_i
         hidden_states_repeated = hidden_states.unsqueeze(0).repeat(self.num_samples, 1, 1)
-        latent_predictions = self.generative_head.sample(hidden_states_repeated)
+        latent_predictions = self.generative_head.sample(hidden_states_repeated)    # (B, L-1, latent_size)
 
         # 5. 计算负 Energy Score 作为 loss
         loss = -self.energy_score(latent_predictions, mean, log_std)
