@@ -158,7 +158,7 @@ class Decoder(LlamaPreTrainedModel):
                 decoder_layer = self.decoder_layers[decoder_idx]
                 hidden_states = decoder_layer(hidden_states)
 
-            if stage == 0:
+            if stage == 0:  # 第一阶段执性完的时候扩维
                 hidden_states = self.expand_layer(hidden_states)    # [B, L, K*d]
                 hidden_states = hidden_states.reshape(batch_size, seq_length * self.patch_size, -1)     # [B, L*K, d]
 
@@ -238,7 +238,7 @@ class Autoencoder(LlamaPreTrainedModel):
         logits = logits.view(-1, self.config.vocab_size)
         labels = labels.view(-1).to(logits.device)
         loss = loss_fct(logits, labels) 
-        
+
         # 总的loss：CE + KL散度，KL是为了约束z的分布使其对齐标准正态分布，分布更平滑，防止微小扰动
         if self.training:
             loss = loss * self.patch_size + kl_loss * self.kl_weight
